@@ -1,0 +1,6 @@
+var speed = $prop('DataCorePlugin.GameData.NewData.SpeedKmh') || 
+            $prop('DataCorePlugin.GameData.NewData.Speed') || 0;
+var rpm = $prop('DataCorePlugin.GameData.NewData.Rpms') || 0;
+var fuel = $prop('DataCorePlugin.GameData.NewData.Fuel') || 0;
+var maxRpm = $prop('DataCorePlugin.GameData.NewData.MaxRpm') || 10000;
+return JSON.stringify({ Speed: speed, Rpms: rpm, Fuel: fuel, MaxRpm: maxRpm }) + "\n";

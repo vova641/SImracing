@@ -1,0 +1,171 @@
+#include <Arduino.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
+#include <ESP32Encoder.h>
+
+// ========== ДИСПЛЕЙ ==========
+TFT_eSPI tft = TFT_eSPI();
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[TFT_WIDTH * TFT_HEIGHT / 10];
+
+// ========== КНОПКИ ==========
+const int buttonPins[6] = {3, 4, 5, 6, 8, 9};
+
+// ========== ЭНКОДЕРЫ ==========
+const int enc1_CLK = 14, enc1_DT = 11, enc1_SW = 2;
+const int enc2_CLK = 13, enc2_DT = 10, enc2_SW = 12;
+
+ESP32Encoder encoder1, encoder2;
+
+bool lastButtonState[6];
+bool lastEnc1SW = HIGH, lastEnc2SW = HIGH;
+int currentSpeed = 0, currentRPM = 0, fuelLevel = 50;
+
+lv_obj_t *scr, *rpm_leds[10], *speed_label, *fuel_label;
+
+// ---------- ОТРИСОВКА ДИСПЛЕЯ ----------
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+  uint32_t w = area->x2 - area->x1 + 1, h = area->y2 - area->y1 + 1;
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors((uint16_t *)color_p, w * h, true);
+  tft.endWrite();
+  lv_disp_flush_ready(disp);
+}
+
+void create_rpm_leds() {
+  int cx = 120, cy = 120, rad = 95, size = 14;
+  for (int i = 0; i < 10; i++) {
+    float ang = (-90 + i * 36.0) * PI / 180.0;
+    int x = cx + rad * cos(ang), y = cy + rad * sin(ang);
+    rpm_leds[i] = lv_led_create(scr);
+    lv_obj_set_pos(rpm_leds[i], x - size/2, y - size/2);
+    lv_obj_set_size(rpm_leds[i], size, size);
+    lv_led_set_color(rpm_leds[i], lv_color_hex(0xFFA500)); // оранжевый
+    lv_led_off(rpm_leds[i]);
+  }
+}
+
+void update_rpm_leds(int rpm) {
+  int active = rpm / 1000;
+  if (active > 10) active = 10;
+  for (int i = 0; i < 10; i++) {
+    if (i < active) lv_led_on(rpm_leds[i]);
+    else lv_led_off(rpm_leds[i]);
+  }
+}
+
+void create_center_display() {
+  speed_label = lv_label_create(scr);
+  lv_obj_set_style_text_color(speed_label, lv_color_hex(0xFFFFFF), LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, LV_STATE_DEFAULT);
+  lv_label_set_text(speed_label, "0");
+  lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
+
+  lv_obj_t *unit = lv_label_create(scr);
+  lv_label_set_text(unit, "km/h");
+  lv_obj_set_style_text_color(unit, lv_color_hex(0xAAAAAA), LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(unit, &lv_font_montserrat_14, LV_STATE_DEFAULT);
+  lv_obj_align_to(unit, speed_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+
+  fuel_label = lv_label_create(scr);
+  lv_obj_set_style_text_color(fuel_label, lv_color_hex(0x00AAFF), LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(fuel_label, &lv_font_montserrat_20, LV_STATE_DEFAULT);
+  lv_label_set_text_fmt(fuel_label, "⛽ %d%%", fuelLevel);
+  lv_obj_align(fuel_label, LV_ALIGN_CENTER, 0, 40);
+}
+
+void sendAllStates() {
+  JsonDocument doc;
+  for (int i = 0; i < 6; i++) doc["btn" + String(i+1)] = !digitalRead(buttonPins[i]);
+  doc["Enc1Value"] = encoder1.getCount();
+  doc["Enc2Value"] = encoder2.getCount();
+  doc["Enc1Clk"] = (digitalRead(enc1_SW) == LOW);
+  doc["Enc2Clk"] = (digitalRead(enc2_SW) == LOW);
+  String output;
+  serializeJson(doc, output);
+  Serial.println(output);
+}
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin(18, -1, 15, 7);
+  tft.init(); tft.setRotation(0); tft.fillScreen(TFT_BLACK);
+
+  for (int i = 0; i < 6; i++) { pinMode(buttonPins[i], INPUT_PULLUP); lastButtonState[i] = HIGH; }
+  pinMode(enc1_SW, INPUT_PULLUP); pinMode(enc2_SW, INPUT_PULLUP);
+
+  encoder1.attachHalfQuad(enc1_CLK, enc1_DT);
+  encoder2.attachHalfQuad(enc2_CLK, enc2_DT);
+  encoder1.clearCount(); encoder2.clearCount();
+  encoder1.setFilter(1023); encoder2.setFilter(1023);
+
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, TFT_WIDTH * TFT_HEIGHT / 10);
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = TFT_WIDTH; disp_drv.ver_res = TFT_HEIGHT;
+  disp_drv.flush_cb = my_disp_flush; disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_STATE_DEFAULT);
+
+  // логотип
+  lv_obj_t *logo = lv_label_create(scr);
+  lv_label_set_text(logo, "SIM RACING");
+  lv_obj_set_style_text_color(logo, lv_color_hex(0xFFA500), LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(logo, &lv_font_montserrat_48, LV_STATE_DEFAULT);
+  lv_obj_center(logo); lv_timer_handler(); delay(2000); lv_obj_del(logo);
+
+  create_rpm_leds();
+  create_center_display();
+  update_rpm_leds(0);
+  lv_label_set_text(speed_label, "0");
+  lv_label_set_text_fmt(fuel_label, "⛽ %d%%", fuelLevel);
+
+  Serial.println("LVGL Ready");
+}
+
+void loop() {
+  // приём данных из SimHub
+  if (Serial.available()) {
+    String json = Serial.readStringUntil('\n'); json.trim();
+    if (json.length() && json[0] == '{') {
+      JsonDocument doc;
+      if (!deserializeJson(doc, json)) {
+        if (doc["Speed"].is<float>()) currentSpeed = (int)doc["Speed"];
+        if (doc["Rpms"].is<float>()) currentRPM = (int)doc["Rpms"];
+        if (doc["Fuel"].is<float>()) fuelLevel = (int)doc["Fuel"];
+        lv_label_set_text_fmt(speed_label, "%d", currentSpeed);
+        update_rpm_leds(currentRPM);
+        lv_label_set_text_fmt(fuel_label, "⛽ %d%%", fuelLevel);
+      }
+    }
+  }
+
+  // обработка обычных кнопок
+  for (int i = 0; i < 6; i++) {
+    bool now = digitalRead(buttonPins[i]);
+    if (now == LOW && lastButtonState[i] == HIGH) { sendAllStates(); delay(50); }
+    lastButtonState[i] = now;
+  }
+
+  // кнопки энкодеров
+  bool sw1 = digitalRead(enc1_SW);
+  if (sw1 == LOW && lastEnc1SW == HIGH) { sendAllStates(); delay(50); }
+  lastEnc1SW = sw1;
+
+  bool sw2 = digitalRead(enc2_SW);
+  if (sw2 == LOW && lastEnc2SW == HIGH) { sendAllStates(); delay(50); }
+  lastEnc2SW = sw2;
+
+  // вращение энкодеров
+  static long lastEnc1 = 0, lastEnc2 = 0;
+  long nowEnc1 = encoder1.getCount(), nowEnc2 = encoder2.getCount();
+  if (nowEnc1 != lastEnc1 || nowEnc2 != lastEnc2) { sendAllStates(); lastEnc1 = nowEnc1; lastEnc2 = nowEnc2; }
+
+  lv_timer_handler();
+  delay(5);
+}
